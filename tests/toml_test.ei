@@ -43,7 +43,7 @@ fn dump(src: str) uses io {
 }
 
 fn main() uses io {
-    dump("# manifest\n[package]\nname = \"warehouse\"   # trailing\nversion = \"0.1.0\"\n\n[deps.json]\ngit = \"https://example.com/json.git\"\nversion = \"1.2.0\"\nuses = [\"io\", \"fs\",]\n\n[deps]\ngeom = { path = \"../geom\", uses = [] }\n\"quoted key\" = -42\nflag = false\n")
+    dump("# manifest\n[package]\nname = \"warehouse\"   # trailing\nversion = \"0.1.0\"\n\n[deps.json]\ngit = \"https://example.com/json.git\"\nversion = \"1.2.0\"\nuses = [\"io\", \"fs\",]\n\n[deps]\ngeom = {{ path = \"../geom\", uses = [] }}\n\"quoted key\" = -42\nflag = false\n")
     dump("[[package]]\nname = \"a\"\n[[package]]\nname = \"b\"\ndeps = [\n  \"a\", # comment\n  \"c\"\n]\n")
     dump("a = \"tab\\tq\\\"\"\nb = 1_000\n")
     dump("a = 1\na = 2\n")

@@ -229,7 +229,7 @@ fn value(inout p: P, k: List[u8], inout out: List[Entry]) -> Result[bool, ParseE
                 bump(inout p)
                 return Ok(true)
             }
-            if peek(p) != 44 { return Err(fail(p, "expected `,` or `}`")) }
+            if peek(p) != 44 { return Err(fail(p, r"expected `,` or `}`")) }
             bump(inout p)
         }
     }
