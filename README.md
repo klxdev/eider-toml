@@ -34,7 +34,7 @@ sh scripts/test.sh      # build, then run tests/*.ei against their .out files
 
 The toolchain is the eider-lang checkout `$EIDER_ROOT` (default `../eider-lang`); its
 `VERSION` must have this package's MAJOR.MINOR (the `eider` field of `eider.toml`), else the
-scripts stop with exit 2 and say which release to use. It has no dependencies beyond the toolchain's `core` and `std`. eider-lang keeps a pinned copy of it in `vendor/toml` for its own tools (`scripts/vendor.sh`); that copy must stay byte-identical to a tagged release here.
+scripts stop with exit 2 and say which release to use. It has no dependencies beyond the toolchain's `core` and `std`. eider-lang pins a release of it in its `vendor.lock` and fetches it into `.vendor/toml` for its own tools (`scripts/vendor.sh`, which checks the content hash); that copy must stay byte-identical to a tagged release here.
 
 eider-lang's `scripts/verify.sh` builds and tests this repository against its own checkout
 when it is next to it (`scripts/check-tools.sh`).
