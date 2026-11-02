@@ -3,6 +3,10 @@
 eider-toml's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## 0.4.0
+
+For Eider 0.4 (`eider = "0.4"`). Nothing else changed.
+
 ## 0.3.0
 
 For Eider 0.3 (`eider = "0.3"`): every plain string literal interpolates (eider-lang U29), so
