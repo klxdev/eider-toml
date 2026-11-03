@@ -1,0 +1,40 @@
+empty: ok, 0 top-level keys
+comment only: ok, 0 top-level keys
+crlf: ok, 2 top-level keys
+bom: ok, 1 top-level keys
+bare and quoted keys: ok, 3 top-level keys
+dotted: ok, 1 top-level keys
+dotted then header: line 3, column 1: the table is defined twice
+header then dotted: line 4, column 1: the table is defined twice
+implicit then defined: ok, 1 top-level keys
+duplicate: line 2, column 5: the key is defined twice
+duplicate dotted: line 2, column 5: the key is defined twice
+array of tables: ok, 1 top-level keys
+table then array: line 4, column 1: the key is already defined and is not an array of tables
+static array extended: line 3, column 1: the key is already defined and is not an array of tables
+ints: ok, 7 top-level keys
+leading zero: line 1, column 8: an integer has no leading zeros
+int overflow: line 1, column 24: integer out of range
+min int: ok, 1 top-level keys
+floats: ok, 8 top-level keys
+float no digits: line 1, column 7: digits are needed after the decimal point
+float no int: line 1, column 7: not a valid float
+sign only: line 1, column 6: expected a value (a string, number, boolean, date-time, array or inline table)
+bools: ok, 2 top-level keys
+bool case: line 1, column 9: expected a value (a string, number, boolean, date-time, array or inline table)
+dates: ok, 6 top-level keys
+strings: ok, 4 top-level keys
+bad escape: line 1, column 7: unknown escape
+unterminated: line 1, column 9: unterminated string
+quotes in multi: ok, 2 top-level keys
+arrays: ok, 4 top-level keys
+array missing comma: line 1, column 8: expected `,` or `]`
+inline tables: ok, 2 top-level keys
+inline trailing comma: line 1, column 14: expected a key
+inline extended: line 3, column 1: an inline table cannot be extended
+no value: line 1, column 4: expected a value
+trailing garbage: line 1, column 7: expected the end of the line
+no newline at end: ok, 1 top-level keys
+header spaces: ok, 1 top-level keys
+empty key: line 1, column 1: expected a key
+deep: ok, 1 top-level keys

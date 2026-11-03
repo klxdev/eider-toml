@@ -1,12 +1,20 @@
 # eider-toml
 
-The TOML subset Eider manifests and lockfiles use (`eider.toml`, `eider.lock`), for [Eider](https://github.com/klxdev/eider-lang). Pure Eider; it needs no capability.
+TOML for [Eider](https://github.com/klxdev/eider-lang): a `std/serial` format, a complete TOML 1.0 document tree, and the flattened subset eider-pkg reads. Pure Eider; it needs no capability.
 
-- Comments, `[a]` / `[a.b]` headers, `[[a]]` arrays of tables, bare, quoted and dotted keys,
-  basic strings, integers, booleans, arrays of strings (across lines) and inline tables.
-- `toml.parse(bytes)` flattens a document into `Entry` values keyed by their full dotted key
-  (the n-th `[[a]]` table is the prefix `a.<n>`), with source lines; `get`, `children` and
-  `quote` (a TOML basic string) work on that.
+- **Typed values** (`import toml`, eider-lang #167): a type with `@[derive(Serialize, Deserialize)]`
+  goes to TOML with `toml.to_string(x)` and comes back with
+  `let r: Result[Config, serial.Error] = toml.from_string(text)`. `@[serial(...)]` shapes the
+  mapping for every format and `@[toml(...)]` (`name`, `skip`, `default`, `rename_all`, `tag`,
+  `unknown`) for this one. Records are tables, lists of records `[[arrays of tables]]`, an absent
+  option is left out, bytes are base64 text, a `time.DateTime` is a TOML date-time. Errors name
+  their place (`servers[1].port`).
+- **The document** (`import toml.doc`): `doc.parse(bytes)` reads all of TOML 1.0 into a tree
+  (any depth of arrays and tables, dotted keys, every string form, floats, date-times) and checks
+  the spec's rules for redefinition.
+- **The flattened subset** eider-pkg reads (`eider.toml`, `eider.lock`): `toml.parse(bytes)`
+  flattens a document into `Entry` values keyed by their full dotted key (the n-th `[[a]]` table is
+  the prefix `a.<n>`), with source lines; `get`, `children` and `quote` work on that.
 
 Errors carry the line and column.
 

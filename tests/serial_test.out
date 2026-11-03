@@ -1,0 +1,52 @@
+TOML éxample
+1000
+c
+d
+Tom
+2
+beta
+16
+1979-05-27T07:32:00Z
+-- written
+title = "TOML éxample"
+max-conns = 1000
+ratio = 0.65
+tags = ["a", "b", "c\nd"]
+created = 1979-05-27T07:32:00Z
+
+[owner]
+name = "Tom"
+mail = "tom@example.com"
+
+[[servers]]
+host = "alpha"
+port = 80
+tls = false
+
+[[servers]]
+host = "beta"
+port = 443
+tls = true
+
+[limits]
+cpu = 4
+mem = 16
+round trip: same
+-- shapes
+shapes = [{kind = "circle", radius = 2}, {kind = "rect", w = 3, h = 4}, "empty"]
+payload = "AQID"
+2
+3
+missing -> missing field `max-conns`
+unknown -> unknown field `bogus`
+type -> title: expected a string, found an integer
+syntax -> line 1, column 9: expected a value
+dup -> line 2, column 9: the key is defined twice
+table twice -> line 4, column 1: the table is defined twice
+inline closed -> line 3, column 1: an inline table cannot be extended
+path -> servers[0].port: expected an integer, found a string
+local time -> created: expected a date-time with a UTC offset, found a local date or time
+1
+2
+-- top level
+a TOML document is a table: write a record or a map at the top

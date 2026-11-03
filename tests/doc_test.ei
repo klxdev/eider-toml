@@ -1,0 +1,64 @@
+import std.bytes
+import std.io
+import toml.doc
+
+// The TOML 1.0 parser: what it accepts and what it refuses, with positions.
+
+fn t(label: str, src: str) uses io {
+    let mut l = label.bytes()
+    match doc.parse(src.bytes()) {
+        Ok(d) => {
+            bytes.append(inout l, ": ok, ".bytes())
+            bytes.append(inout l, bytes.from_u64(doc.len(d, d.root) as u64))
+            bytes.append(inout l, " top-level keys".bytes())
+        }
+        Err(e) => {
+            bytes.append(inout l, ": ".bytes())
+            bytes.append(inout l, doc.error_text(e))
+        }
+    }
+    io.outln(l)
+}
+
+fn main() uses io {
+    t("empty", "")
+    t("comment only", "# hi\n")
+    t("crlf", "a = 1\r\nb = 2\r\n")
+    t("bom", "\u{FEFF}a = 1\n")
+    t("bare and quoted keys", "a-b_c = 1\n\"q k\" = 2\n'l k' = 3\n")
+    t("dotted", "a.b.c = 1\na.b.d = 2\n")
+    t("dotted then header", "a.b = 1\n[a]\nc = 2\n")
+    t("header then dotted", "[a]\nb.c = 1\n[a.b]\nd = 1\n")
+    t("implicit then defined", "[a.b]\nx = 1\n[a]\ny = 2\n")
+    t("duplicate", "a = 1\na = 2\n")
+    t("duplicate dotted", "a.b = 1\na = 2\n")
+    t("array of tables", "[[a]]\nx = 1\n[[a]]\nx = 2\n[a.sub]\ny = 1\n")
+    t("table then array", "[a]\nx = 1\n[[a]]\n")
+    t("static array extended", "a = [1]\n[[a]]\n")
+    t("ints", "a = 0\nb = -17\nc = +5\nd = 1_000\ne = 0xDEAD_beef\nf = 0o755\ng = 0b1101\n")
+    t("leading zero", "a = 007\n")
+    t("int overflow", "a = 9223372036854775808\n")
+    t("min int", "a = -9223372036854775808\n")
+    t("floats", "a = 3.14\nb = -0.01\nc = 5e+22\nd = 1e-2\ne = 6.626e-34\nf = 224_617.445_991\ng = inf\nh = -nan\n")
+    t("float no digits", "a = 1.\n")
+    t("float no int", "a = .5\n")
+    t("sign only", "a = +\n")
+    t("bools", "a = true\nb = false\n")
+    t("bool case", "a = True\n")
+    t("dates", "a = 1979-05-27\nb = 07:32:00\nc = 1979-05-27T07:32:00\nd = 1979-05-27T07:32:00Z\ne = 1979-05-27T00:32:00-07:00\nf = 1979-05-27 07:32:00.999999\n")
+    t("strings", "a = \"x\\ty\\u00e9\\U0001F600\"\nb = 'C:\\raw'\nc = \"\"\"\nline1\nline2 \\\n   cont\"\"\"\nd = '''\nraw\n'''\n")
+    t("bad escape", "a = \"\\q\"\n")
+    t("unterminated", "a = \"abc\n")
+    t("quotes in multi", "a = \"\"\"x\"\"\"\"\nb = '''y''''\n")
+    t("arrays", "a = [1, 2,\n  3, # c\n]\nb = [[1, 2], [\"a\", 'b']]\nc = [1, \"mixed\", 2.5]\nd = []\n")
+    t("array missing comma", "a = [1 2]\n")
+    t("inline tables", "a = {{ x = 1, y.z = 2, w = {{ q = [1] }} }}\nb = {{}}\n")
+    t("inline trailing comma", "a = {{ x = 1, }}\n")
+    t("inline extended", "a = {{ x = 1 }}\n[a.y]\n")
+    t("no value", "a =\n")
+    t("trailing garbage", "a = 1 b = 2\n")
+    t("no newline at end", "a = 1")
+    t("header spaces", "[ a . b ]\nc = 1\n")
+    t("empty key", "= 1\n")
+    t("deep", "a = [[[[[[[[1]]]]]]]]\n")
+}

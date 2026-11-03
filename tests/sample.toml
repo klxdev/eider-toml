@@ -1,0 +1,24 @@
+# a comment
+title = "TOML éxample"
+max-conns = 1_000
+ratio = 6.5e-1
+tags = ["a", 'b', """c
+d"""]
+created = 1979-05-27 07:32:00Z
+
+[owner]
+name = "Tom"
+mail = "tom@example.com"
+
+[limits]
+cpu = 4
+mem = 0x10
+
+[[servers]]
+host = "alpha"
+port = 80
+
+[[servers]]
+host = "beta"
+port = 443
+tls = true

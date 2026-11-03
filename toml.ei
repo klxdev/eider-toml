@@ -1,12 +1,34 @@
-//! toml: the TOML subset Eider manifests and lockfiles use. Pure Eider, no capabilities.
+//! toml: TOML for Eider. Pure Eider, no capabilities.
 //!
-//! Supported: comments, `[a]` / `[a.b]` headers, `[[a]]` array-of-tables headers, bare and
-//! quoted keys, dotted keys, basic strings (\n \t \r \" \\ escapes), integers, booleans,
-//! arrays of strings (may span lines), and inline tables `{ k = v, ... }`.
-//! The document is flattened: every value gets its full dotted key, and the n-th `[[a]]`
-//! table (from 0) is the key prefix `a.<n>`.
+//! Two APIs:
+//!
+//! - Typed values: this package is the TOML format for `std/serial` (eider-lang #100, #167). A
+//!   type with `@[derive(Serialize, Deserialize)]`, or your own impls, goes to TOML with
+//!   `to_string(x)` / `to_bytes(x)` and comes back with `from_string(s)` / `from_bytes(src)`;
+//!   the type to read is the expected one: `let r: Result[Config, serial.Error] =
+//!   toml.from_string(text)`. `@[serial(...)]` shapes the mapping for every format and
+//!   `@[toml(...)]` (`name`, `skip`, `default`, `rename_all`, `tag`, `unknown`) for this one.
+//!   The whole of TOML 1.0 is read (`toml.doc`: tables, arrays of tables, dotted keys, every
+//!   string form, floats, date-times, inline tables). A record is a table, a list an array
+//!   (a list of records is written as `[[array of tables]]`), an absent option is left out, bytes
+//!   are a base64 string, a time is a TOML date-time, a variant without fields is its name and
+//!   one with fields a sub-table under its name (or, with `tag`, a table that has the tag).
+//!   Reading is strict like JSON's: a key no field takes is an error unless
+//!   `@[toml(unknown = "ignore")]`, and every error names its place (`servers[1].port`).
+//!   TOML has no null: an absent option inside a list cannot be written (an error), and the top
+//!   level must be a table.
+//! - The flattened subset eider-pkg reads (`eider.toml`, `eider.lock`): `parse` flattens a
+//!   document into `Entry` values keyed by their full dotted key (the n-th `[[a]]` table is the
+//!   prefix `a.<n>`), with source lines; `get`, `children` and `quote` work on that. It holds
+//!   comments, `[a]` / `[a.b]` headers, `[[a]]` arrays of tables, bare, quoted and dotted keys,
+//!   basic strings (\n \t \r \" \\ escapes), integers, booleans, arrays of strings (may span
+//!   lines), and inline tables `{ k = v, ... }`.
 
 import std.bytes
+import std.encoding
+import std.serial
+import std.time
+import toml.doc
 
 pub type Val = | Str(s: List[u8]) | Int(n: i64) | Bool(b: bool) | Strs(items: List[List[u8]])
 
@@ -355,4 +377,286 @@ pub fn quote(s: List[u8]) -> List[u8] {
     }
     out.push(34)
     out
+}
+
+// ---- typed values: the format for std/serial
+
+/// A TOML writer for `serial.Serialize` (`to_bytes`, `to_string`): the format named "toml". The
+/// events build a `serial.Value` (a TOML document cannot be written in event order: a table's
+/// plain keys come before its sub-tables), which `to_bytes` renders.
+pub type Serializer = { v: serial.ValueSerializer }
+
+pub fn serializer() -> Serializer { Serializer(serial.ValueSerializer(List.new(), None, false)) }
+
+impl serial.Serializer for Serializer {
+    fn format(self) -> str { "toml" }
+    fn bool(inout self, v: bool) -> Result[(), serial.Error] { self.v.bool(v) }
+    fn int(inout self, v: i64) -> Result[(), serial.Error] { self.v.int(v) }
+    fn uint(inout self, v: u64) -> Result[(), serial.Error] {
+        if v > 9223372036854775807 { return Err(serial.error("TOML integers are 64-bit signed: the number is too large")) }
+        self.v.uint(v)
+    }
+    fn float(inout self, v: f64) -> Result[(), serial.Error] { self.v.float(v) }
+    fn string(inout self, v: List[u8]) -> Result[(), serial.Error] { self.v.string(v) }
+    fn bytes(inout self, v: List[u8]) -> Result[(), serial.Error] { self.v.bytes(v) }
+    fn time(inout self, v: time.DateTime) -> Result[(), serial.Error] { self.v.time(v) }
+    fn none(inout self) -> Result[(), serial.Error] { self.v.none() }
+    fn begin_list(inout self, len: usize) -> Result[(), serial.Error] { self.v.begin_list(len) }
+    fn end_list(inout self) -> Result[(), serial.Error] { self.v.end_list() }
+    fn begin_map(inout self, len: usize) -> Result[(), serial.Error] { self.v.begin_map(len) }
+    fn key(inout self, k: List[u8]) -> Result[(), serial.Error] { self.v.key(k) }
+    fn end_map(inout self) -> Result[(), serial.Error] { self.v.end_map() }
+    fn begin_record(inout self, len: usize) -> Result[(), serial.Error] { self.v.begin_record(len) }
+    fn field(inout self, name: List[u8]) -> Result[(), serial.Error] { self.v.field(name) }
+    fn end_record(inout self) -> Result[(), serial.Error] { self.v.end_record() }
+    fn begin_variant(inout self, name: List[u8], tag: List[u8], len: usize) -> Result[(), serial.Error] { self.v.begin_variant(name, tag, len) }
+    fn end_variant(inout self) -> Result[(), serial.Error] { self.v.end_variant() }
+    fn merge_next(inout self) -> Result[(), serial.Error] { self.v.merge_next() }
+}
+
+fn is_bare_key(k: List[u8]) -> bool {
+    if k.len() == 0 { return false }
+    for c in k {
+        if !(bytes.is_ident(c) || c == 45) { return false }
+    }
+    true
+}
+
+fn key_text(k: List[u8]) -> List[u8] {
+    if is_bare_key(k) { return k }
+    quote_full(k)
+}
+
+/// A basic string with every control character escaped.
+fn quote_full(s: List[u8]) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    out.push(34)
+    for c in s {
+        if c == 34 || c == 92 {
+            out.push(92)
+            out.push(c)
+        } else if c == 10 {
+            bytes.append(inout out, r"\n".bytes())
+        } else if c == 9 {
+            bytes.append(inout out, r"\t".bytes())
+        } else if c == 13 {
+            bytes.append(inout out, r"\r".bytes())
+        } else if c < 32 || c == 127 {
+            bytes.append(inout out, r"\u00".bytes())
+            out.push(hex_nibble(c / 16))
+            out.push(hex_nibble(c % 16))
+        } else {
+            out.push(c)
+        }
+    }
+    out.push(34)
+    out
+}
+
+fn hex_nibble(n: u8) -> u8 {
+    if n < 10 { return 48 + n }
+    87 + n
+}
+
+fn float_text(v: f64) -> List[u8] {
+    if v != v { return "nan".bytes() }
+    if v - v != 0.0 {
+        if v < 0.0 { return "-inf".bytes() }
+        return "inf".bytes()
+    }
+    let mut t = v.to_string().bytes()
+    // a float must not look like an integer
+    let mut plain = true
+    for c in t {
+        if c == 46 || c == 101 || c == 69 { plain = false }
+    }
+    if plain { bytes.append(inout t, ".0".bytes()) }
+    t
+}
+
+fn is_null(v: serial.Value) -> bool {
+    match v {
+        serial.VNull => true
+        _ => false
+    }
+}
+
+fn is_map(v: serial.Value) -> bool {
+    match v {
+        serial.VMap(_) => true
+        _ => false
+    }
+}
+
+/// A non-empty list whose elements are all tables: written as `[[a.b]]` sections.
+fn is_tables(v: serial.Value) -> bool {
+    match v {
+        serial.VList(xs) => {
+            if xs.len() == 0 { return false }
+            for x in xs {
+                if !is_map(x) { return false }
+            }
+            true
+        }
+        _ => false
+    }
+}
+
+/// A value written inline: scalars, arrays and inline tables.
+fn inline(inout out: List[u8], v: serial.Value) -> Result[(), serial.Error] {
+    match v {
+        serial.VNull => Err(serial.error("TOML has no null: an absent option cannot be written inside a list"))
+        serial.VBool(b) => {
+            let word = if b { "true".bytes() } else { "false".bytes() }
+            bytes.append(inout out, word)
+            Ok(())
+        }
+        serial.VInt(n) => {
+            bytes.append(inout out, bytes.from_i64(n))
+            Ok(())
+        }
+        serial.VUint(u) => {
+            bytes.append(inout out, bytes.from_u64(u))
+            Ok(())
+        }
+        serial.VFloat(f) => {
+            bytes.append(inout out, float_text(f))
+            Ok(())
+        }
+        serial.VStr(s) => {
+            bytes.append(inout out, quote_full(s))
+            Ok(())
+        }
+        serial.VBytes(b) => {
+            bytes.append(inout out, quote_full(encoding.base64(b).bytes()))
+            Ok(())
+        }
+        serial.VTime(t) => {
+            bytes.append(inout out, t.rfc3339().bytes())
+            Ok(())
+        }
+        serial.VList(xs) => {
+            out.push(91)
+            for i in 0..xs.len() {
+                if i > 0 { bytes.append(inout out, ", ".bytes()) }
+                inline(inout out, xs[i].copy())?
+            }
+            out.push(93)
+            Ok(())
+        }
+        serial.VMap(es) => {
+            out.push(123)
+            let mut first = true
+            for e in es {
+                if is_null(e.value) { continue }
+                if !first { bytes.append(inout out, ", ".bytes()) }
+                first = false
+                bytes.append(inout out, key_text(e.key))
+                bytes.append(inout out, " = ".bytes())
+                inline(inout out, e.value.copy())?
+            }
+            out.push(125)
+            Ok(())
+        }
+    }
+}
+
+fn dotted(path: List[List[u8]]) -> List[u8] {
+    let mut parts: List[List[u8]] = List.new()
+    for k in path { parts.push(key_text(k)) }
+    bytes.join(parts, ".".bytes())
+}
+
+/// The members of a table: plain `key = value` lines first, then its sub-tables.
+fn table_body(inout out: List[u8], path: List[List[u8]], es: List[serial.Entry]) -> Result[(), serial.Error] {
+    for e in es {
+        if is_null(e.value) || is_map(e.value) || is_tables(e.value) { continue }
+        bytes.append(inout out, key_text(e.key))
+        bytes.append(inout out, " = ".bytes())
+        match inline(inout out, e.value.copy()) {
+            Ok(_) => {}
+            Err(err) => {
+                let mut where_ = path.copy()
+                where_.push(e.key.copy())
+                return Err(serial.error_at(dotted(where_), err.msg))
+            }
+        }
+        out.push(10)
+    }
+    for e in es {
+        let mut sub = path.copy()
+        sub.push(e.key.copy())
+        match e.value {
+            serial.VMap(inner) => {
+                if out.len() > 0 { out.push(10) }
+                out.push(91)
+                bytes.append(inout out, dotted(sub))
+                bytes.append(inout out, "]\n".bytes())
+                table_body(inout out, sub, inner)?
+            }
+            serial.VList(xs) => {
+                if is_tables(e.value) {
+                    for x in xs {
+                        match x {
+                            serial.VMap(inner) => {
+                                if out.len() > 0 { out.push(10) }
+                                bytes.append(inout out, "[[".bytes())
+                                bytes.append(inout out, dotted(sub))
+                                bytes.append(inout out, "]]\n".bytes())
+                                table_body(inout out, sub, inner)?
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The TOML text of a table value.
+fn render(v: serial.Value) -> Result[List[u8], serial.Error] {
+    match v {
+        serial.VMap(es) => {
+            let mut out: List[u8] = List.new()
+            table_body(inout out, List.new(), es)?
+            Ok(out)
+        }
+        _ => Err(serial.error("a TOML document is a table: write a record or a map at the top"))
+    }
+}
+
+/// `x` as TOML text. `x` must be a record, a map or an enum with fields.
+pub fn to_bytes[T: serial.Serialize](x: T) -> Result[List[u8], serial.Error] {
+    let mut s = serializer()
+    x.serialize(inout s)?
+    match s.v.out {
+        Some(v) => render(v)
+        None => Err(serial.error("nothing was written"))
+    }
+}
+
+/// `x` as TOML text, as a `String`.
+pub fn to_string[T: serial.Serialize](x: T) -> Result[String, serial.Error] {
+    let b = to_bytes(x)?
+    match String.from_bytes(b) {
+        Ok(s) => Ok(s)
+        Err(_) => Err(serial.error("the text has a NUL character"))
+    }
+}
+
+/// The value of type T in the TOML text `src`, parsed within `doc.limits()` (8 MiB).
+pub fn from_bytes[T: serial.Deserialize](src: List[u8]) -> Result[T, serial.Error] { from_bytes_with(src, doc.limits()) }
+
+/// The value of type T in the TOML text `s`.
+pub fn from_string[T: serial.Deserialize](s: String) -> Result[T, serial.Error] { from_bytes(s.bytes()) }
+
+pub fn from_bytes_with[T: serial.Deserialize](src: List[u8], lim: doc.Limits) -> Result[T, serial.Error] {
+    let d = match doc.parse_with(src, lim) {
+        Ok(x) => x
+        Err(e) => { return Err(serial.error_at(List.new(), doc.error_text(e))) }
+    }
+    T.deserialize(doc.deserializer(d, d.root))
 }

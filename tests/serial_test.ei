@@ -1,0 +1,145 @@
+import std.bytes
+import std.fs
+import std.io
+import std.serial
+import std.time
+import toml
+import toml.doc
+
+// TOML as a std/serial format (eider-lang #167): the full syntax read into records, maps and
+// lists; records and variants written; round trips; strict errors with paths.
+
+@[derive(Serialize, Deserialize)]
+type Server = { host: String, port: i32, @[serial(default)] tls: bool }
+
+@[derive(Serialize, Deserialize), serial(rename_all = "kebab-case")]
+type Config = {
+    title: String,
+    max_conns: u32,
+    ratio: f64,
+    tags: List[String],
+    owner: Owner,
+    servers: List[Server],
+    limits: Map[String, i64],
+    note: Option[String],
+    created: time.DateTime,
+}
+
+@[derive(Serialize, Deserialize)]
+type Owner = { name: String, @[toml(name = "mail")] email: Option[String] }
+
+@[derive(Serialize, Deserialize), serial(tag = "kind", rename_all = "snake_case")]
+type Shape =
+    | Circle(radius: i64)
+    | Rect(w: i64, h: i64)
+    | Empty
+
+@[derive(Serialize, Deserialize)]
+type Drawing = { shapes: List[Shape], payload: serial.Bytes }
+
+@[derive(Serialize, Deserialize), toml(unknown = "ignore")]
+type Loose = { a: i32 }
+
+fn show[T: serial.Serialize](label: str, x: T) uses io {
+    match toml.to_string(x) {
+        Ok(s) => {
+            io.outln(label.bytes())
+            io.out(s.bytes())
+        }
+        Err(e) => {
+            io.outln(label.bytes())
+            io.outln(serial.error_text(e))
+        }
+    }
+}
+
+fn parse_err(label: str, src: str) uses io {
+    let r: Result[Config, serial.Error] = toml.from_string(String.from(src))
+    match r {
+        Ok(_) => io.outln("ok".bytes())
+        Err(e) => {
+            let mut l = label.bytes()
+            bytes.append(inout l, " -> ".bytes())
+            bytes.append(inout l, serial.error_text(e))
+            io.outln(l)
+        }
+    }
+}
+
+fn main() uses io, fs {
+    let src = match fs.read("tests/sample.toml".bytes()) {
+        Ok(b) => b
+        Err(_) => { return }
+    }
+    let r: Result[Config, serial.Error] = toml.from_bytes(src)
+    match r {
+        Ok(c) => {
+            io.outln(c.title.bytes())
+            io.outln(bytes.from_u64(c.max_conns as u64))
+            io.outln(c.tags[2].bytes())
+            io.outln(c.owner.name.bytes())
+            io.outln(bytes.from_u64(c.servers.len() as u64))
+            io.outln(c.servers[1].host.bytes())
+            io.outln(bytes.from_i64(c.limits.get(String.from("mem")).unwrap_or(0)))
+            io.outln(c.created.rfc3339().bytes())
+            show("-- written", c)
+            // the round trip reads back to the same text
+            match toml.to_string(c) {
+                Ok(t) => {
+                    let again: Result[Config, serial.Error] = toml.from_string(t)
+                    match again {
+                        Ok(c2) => match toml.to_string(c2) {
+                            Ok(t2) => {
+                                let same = bytes.eq(t.bytes(), t2.bytes())
+                                if same { io.outln("round trip: same".bytes()) } else { io.outln("round trip: DIFFERENT".bytes()) }
+                            }
+                            Err(_) => io.outln("round trip: error".bytes())
+                        }
+                        Err(e) => io.outln(serial.error_text(e))
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        Err(e) => io.outln(serial.error_text(e))
+    }
+    let mut shapes: List[Shape] = List.new()
+    shapes.push(Circle(2))
+    shapes.push(Rect(3, 4))
+    shapes.push(Empty)
+    let mut raw: List[u8] = List.new()
+    raw.push(1)
+    raw.push(2)
+    raw.push(3)
+    show("-- shapes", Drawing(shapes, serial.Bytes(raw)))
+    let dr: Result[Drawing, serial.Error] = toml.from_string(String.from("payload = \"AQID\"\n[[shapes]]\nkind = \"circle\"\nradius = 5\n[[shapes]]\nkind = \"rect\"\nw = 1\nh = 2\n"))
+    match dr {
+        Ok(d) => {
+            io.outln(bytes.from_u64(d.shapes.len() as u64))
+            io.outln(bytes.from_u64(d.payload.data.len() as u64))
+        }
+        Err(e) => io.outln(serial.error_text(e))
+    }
+    parse_err("missing", "title = \"x\"\n")
+    parse_err("unknown", "bogus = 1\n")
+    parse_err("type", "title = 3\n")
+    parse_err("syntax", "title = \n")
+    parse_err("dup", "title = \"a\"\ntitle = \"b\"\n")
+    parse_err("table twice", "[owner]\nname = \"a\"\n[owner]\n")
+    parse_err("inline closed", "owner = {{ name = \"a\" }}\n[owner.x]\n")
+    parse_err("path", "title = \"x\"\nmax-conns = 1\nratio = 1.0\ntags = []\nowner = {{ name = \"a\" }}\nservers = [ {{ host = \"h\", port = \"p\" }} ]\nlimits = {{}}\ncreated = 1979-05-27T07:32:00Z\n")
+    parse_err("local time", "title = \"x\"\nmax-conns = 1\nratio = 1.0\ntags = []\nowner = {{ name = \"a\" }}\nservers = []\nlimits = {{}}\ncreated = 1979-05-27T07:32:00\n")
+    let l: Result[Loose, serial.Error] = toml.from_string(String.from("a = 1\nb = 2\n"))
+    match l {
+        Ok(x) => io.outln(bytes.from_i64(x.a as i64))
+        Err(e) => io.outln(serial.error_text(e))
+    }
+    // the generic parser
+    match doc.parse("a.b = 1\n[x.y]\nz = [1, 2.5, \"s\", [true]]\n[[x.l]]\nq = 1\n[[x.l]]\nq = 2\n".bytes()) {
+        Ok(d) => {
+            io.outln(bytes.from_u64(doc.len(d, d.root) as u64))
+        }
+        Err(e) => io.outln(doc.error_text(e))
+    }
+    show("-- top level", 5)
+}

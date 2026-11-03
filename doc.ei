@@ -1,0 +1,894 @@
+//! toml.doc: a complete TOML 1.0 document as a tree, and the reader for `std/serial`.
+//!
+//! `parse(src)` reads a whole document: comments, `[table]` and `[[array of tables]]`
+//! headers, bare, quoted and dotted keys, basic, literal and multi-line strings (every escape,
+//! `\uXXXX` and `\UXXXXXXXX` included), integers (decimal with `_`, `0x`, `0o`, `0b`), floats
+//! (`inf` and `nan` too), booleans, offset and local date-times, dates and times, arrays (of any
+//! mix, across lines) and inline tables. The rules of the spec are checked: a key is defined once,
+//! a table is defined once, an inline table or a static array is closed, a dotted key cannot
+//! extend a table that a header defined. Errors carry the 1-based line and column.
+//!
+//! A parsed document is an arena, like eider-json's (Eider has value semantics, so a tree of
+//! owned nodes would be copied on every read): a node is named by its index (`u32`), scalars
+//! keep their text in `strs`, tables and arrays their children in `conts`. `Deserializer` is a
+//! cursor on one node, for `serial.Deserialize`; the format is named "toml".
+
+import std.bytes
+import std.encoding
+import std.serial
+import std.strings
+import std.time
+
+pub const STR: u32 = 1
+pub const INT: u32 = 2
+pub const FLOAT: u32 = 3
+pub const BOOL: u32 = 4
+/// A date-time with an offset (`1979-05-27T07:32:00Z`).
+pub const DATETIME: u32 = 5
+/// A date-time, a date or a time without an offset: it names no instant.
+pub const LOCAL: u32 = 6
+pub const ARRAY: u32 = 7
+pub const TABLE: u32 = 8
+
+/// `a` is the index into `strs` (STR, FLOAT, DATETIME, LOCAL) or `conts` (ARRAY, TABLE); `n`
+/// the integer or the bool.
+pub type Node = { kind: u32, a: u32, n: i64, line: u32 }
+
+// the state of a table: how it came to be, for the redefinition rules
+const IMPLICIT: u32 = 0
+const DEFINED: u32 = 1
+const DOTTED: u32 = 2
+const CLOSED: u32 = 3
+// the state of an array: a static array is closed to `[[...]]`
+const STATIC: u32 = 4
+const TABLES: u32 = 5
+
+type Cont = { keys: List[List[u8]], vals: List[u32], state: u32 }
+
+pub type Doc = { nodes: List[Node], conts: List[Cont], strs: List[List[u8]], root: u32 }
+
+pub type ParseError = { line: u32, col: u32, msg: String }
+
+/// "line L, column C: message"
+pub fn error_text(e: ParseError) -> List[u8] {
+    let mut m = "line ".bytes()
+    bytes.append(inout m, bytes.from_u64(e.line as u64))
+    bytes.append(inout m, ", column ".bytes())
+    bytes.append(inout m, bytes.from_u64(e.col as u64))
+    bytes.append(inout m, ": ".bytes())
+    bytes.append(inout m, e.msg.bytes())
+    m
+}
+
+type P = { src: List[u8], i: usize, line: u32, col: u32, doc: Doc, depth: u32 }
+
+const MAX_DEPTH: u32 = 128
+
+fn fail(p: P, m: str) -> ParseError { ParseError(p.line, p.col, String.from(m)) }
+
+fn peek(p: P) -> u8 {
+    if p.i < p.src.len() { return p.src[p.i] }
+    0
+}
+
+fn peek_at(p: P, k: usize) -> u8 {
+    if p.i + k < p.src.len() { return p.src[p.i + k] }
+    0
+}
+
+fn at_end(p: P) -> bool { p.i >= p.src.len() }
+
+fn bump(inout p: P) {
+    if p.i < p.src.len() {
+        if p.src[p.i] == 10 {
+            p.line += 1
+            p.col = 1
+        } else {
+            p.col += 1
+        }
+        p.i += 1
+    }
+}
+
+/// Spaces and tabs.
+fn blank(inout p: P) {
+    while peek(p) == 32 || peek(p) == 9 { bump(inout p) }
+}
+
+/// A comment, to the end of the line.
+fn comment(inout p: P) -> Result[(), ParseError] {
+    while !at_end(p) && peek(p) != 10 {
+        let c = peek(p)
+        if (c < 32 && c != 9 && c != 13) || c == 127 { return Err(fail(p, "a control character in a comment")) }
+        bump(inout p)
+    }
+    Ok(())
+}
+
+/// Blanks, newlines and comments.
+fn space(inout p: P) -> Result[(), ParseError] {
+    while !at_end(p) {
+        let c = peek(p)
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            bump(inout p)
+        } else if c == 35 {
+            comment(inout p)?
+        } else {
+            return Ok(())
+        }
+    }
+    Ok(())
+}
+
+/// Blanks, an optional comment, then a newline or the end of the input.
+fn end_line(inout p: P) -> Result[(), ParseError] {
+    blank(inout p)
+    if peek(p) == 35 { comment(inout p)? }
+    if peek(p) == 13 && peek_at(p, 1) == 10 { bump(inout p) }
+    if at_end(p) { return Ok(()) }
+    if peek(p) != 10 { return Err(fail(p, "expected the end of the line")) }
+    bump(inout p)
+    Ok(())
+}
+
+fn is_bare(c: u8) -> bool { bytes.is_ident(c) || c == 45 }
+
+fn hexval(c: u8) -> i32 {
+    if c >= 48 && c <= 57 { return (c - 48) as i32 }
+    if c >= 97 && c <= 102 { return (c - 97) as i32 + 10 }
+    if c >= 65 && c <= 70 { return (c - 65) as i32 + 10 }
+    -1
+}
+
+/// Appends the UTF-8 encoding of scalar value `c`.
+fn put_utf8(inout out: List[u8], c: u32) {
+    if c < 128 {
+        out.push(c as u8)
+    } else if c < 2048 {
+        out.push((192 + c / 64) as u8)
+        out.push((128 + c % 64) as u8)
+    } else if c < 65536 {
+        out.push((224 + c / 4096) as u8)
+        out.push((128 + (c / 64) % 64) as u8)
+        out.push((128 + c % 64) as u8)
+    } else {
+        out.push((240 + c / 262144) as u8)
+        out.push((128 + (c / 4096) % 64) as u8)
+        out.push((128 + (c / 64) % 64) as u8)
+        out.push((128 + c % 64) as u8)
+    }
+}
+
+/// `n` hex digits after `\u` or `\U`: one Unicode scalar value.
+fn unicode_escape(inout p: P, n: u32, inout out: List[u8]) -> Result[(), ParseError] {
+    let mut v: u32 = 0
+    for _ in 0..n {
+        let h = hexval(peek(p))
+        if h < 0 { return Err(fail(p, "expected hexadecimal digits in the escape")) }
+        v = v * 16 + h as u32
+        bump(inout p)
+    }
+    if v > 1114111 || (v >= 55296 && v <= 57343) { return Err(fail(p, "the escape is not a Unicode scalar value")) }
+    put_utf8(inout out, v)
+    Ok(())
+}
+
+/// A string with its opening quote at the cursor: `"..."`, `'...'`, `"""..."""` or `'''...'''`.
+fn string(inout p: P) -> Result[List[u8], ParseError] {
+    let q = peek(p)
+    let basic = q == 34
+    let multi = peek_at(p, 1) == q && peek_at(p, 2) == q
+    let mut out: List[u8] = List.new()
+    if multi {
+        bump(inout p)
+        bump(inout p)
+        bump(inout p)
+        // a newline right after the opening quotes is dropped
+        if peek(p) == 13 && peek_at(p, 1) == 10 { bump(inout p) }
+        if peek(p) == 10 { bump(inout p) }
+    } else {
+        bump(inout p)
+    }
+    while true {
+        if at_end(p) { return Err(fail(p, "unterminated string")) }
+        let c = peek(p)
+        if c == q {
+            if !multi {
+                bump(inout p)
+                return Ok(out)
+            }
+            if peek_at(p, 1) == q && peek_at(p, 2) == q {
+                // up to two more quotes may end the string: `""""` is a quote then the end
+                bump(inout p)
+                bump(inout p)
+                bump(inout p)
+                if peek(p) == q {
+                    out.push(q)
+                    bump(inout p)
+                    if peek(p) == q {
+                        out.push(q)
+                        bump(inout p)
+                    }
+                }
+                return Ok(out)
+            }
+            out.push(c)
+            bump(inout p)
+        } else if c == 10 || (c == 13 && peek_at(p, 1) == 10) {
+            if !multi { return Err(fail(p, "unterminated string")) }
+            if c == 13 { bump(inout p) }
+            out.push(10)
+            bump(inout p)
+        } else if basic && c == 92 {
+            bump(inout p)
+            let e = peek(p)
+            if e == 98 {
+                out.push(8)
+            } else if e == 116 {
+                out.push(9)
+            } else if e == 110 {
+                out.push(10)
+            } else if e == 102 {
+                out.push(12)
+            } else if e == 114 {
+                out.push(13)
+            } else if e == 34 || e == 92 {
+                out.push(e)
+            } else if e == 117 {
+                bump(inout p)
+                unicode_escape(inout p, 4, inout out)?
+                continue
+            } else if e == 85 {
+                bump(inout p)
+                unicode_escape(inout p, 8, inout out)?
+                continue
+            } else if multi && (e == 32 || e == 9 || e == 10 || e == 13) {
+                // a backslash at the end of a line trims the whitespace up to the next text
+                let mut j: usize = 0
+                while peek_at(p, j) == 32 || peek_at(p, j) == 9 { j += 1 }
+                let nl = peek_at(p, j)
+                if nl == 10 || (nl == 13 && peek_at(p, j + 1) == 10) {
+                    while peek(p) == 32 || peek(p) == 9 || peek(p) == 10 || peek(p) == 13 { bump(inout p) }
+                    continue
+                }
+                return Err(fail(p, "a backslash before a space must end the line"))
+            } else {
+                return Err(fail(p, "unknown escape"))
+            }
+            bump(inout p)
+        } else {
+            if (c < 32 && c != 9) || c == 127 { return Err(fail(p, "a control character in a string")) }
+            out.push(c)
+            bump(inout p)
+        }
+    }
+    Ok(out)
+}
+
+/// One key segment: bare or quoted.
+fn key_part(inout p: P) -> Result[List[u8], ParseError] {
+    let c = peek(p)
+    if c == 34 || c == 39 {
+        if peek_at(p, 1) == c && peek_at(p, 2) == c { return Err(fail(p, "a key is not a multi-line string")) }
+        return string(inout p)
+    }
+    let mut out: List[u8] = List.new()
+    while is_bare(peek(p)) {
+        out.push(peek(p))
+        bump(inout p)
+    }
+    if out.len() == 0 { return Err(fail(p, "expected a key")) }
+    Ok(out)
+}
+
+/// `a.b."c d"`: the segments.
+fn key_path(inout p: P) -> Result[List[List[u8]], ParseError] {
+    let mut parts: List[List[u8]] = List.new()
+    parts.push(key_part(inout p)?)
+    blank(inout p)
+    while peek(p) == 46 {
+        bump(inout p)
+        blank(inout p)
+        parts.push(key_part(inout p)?)
+        blank(inout p)
+    }
+    Ok(parts)
+}
+
+// ---- the arena
+
+fn add_node(inout p: P, kind: u32, a: u32, n: i64, line: u32) -> u32 {
+    p.doc.nodes.push(Node(kind, a, n, line))
+    (p.doc.nodes.len() - 1) as u32
+}
+
+fn add_str_node(inout p: P, kind: u32, text: List[u8], line: u32) -> u32 {
+    p.doc.strs.push(text)
+    let ix = (p.doc.strs.len() - 1) as u32
+    add_node(inout p, kind, ix, 0, line)
+}
+
+fn add_cont(inout p: P, kind: u32, state: u32, line: u32) -> u32 {
+    p.doc.conts.push(Cont(List.new(), List.new(), state))
+    let ix = (p.doc.conts.len() - 1) as u32
+    add_node(inout p, kind, ix, 0, line)
+}
+
+fn cont_of(p: P, id: u32) -> u32 { p.doc.nodes[id as usize].a }
+
+/// The child `key` of table `t`.
+fn find(p: P, t: u32, key: List[u8]) -> Option[u32] {
+    let c = cont_of(p, t) as usize
+    let n = p.doc.conts[c].keys.len()
+    for i in 0..n {
+        if bytes.eq(p.doc.conts[c].keys[i], key) { return Some(p.doc.conts[c].vals[i]) }
+    }
+    None
+}
+
+fn put(inout p: P, t: u32, key: List[u8], child: u32) {
+    let c = cont_of(p, t) as usize
+    p.doc.conts[c].keys.push(key)
+    p.doc.conts[c].vals.push(child)
+}
+
+fn push_elem(inout p: P, arr: u32, child: u32) {
+    let c = cont_of(p, arr) as usize
+    p.doc.conts[c].vals.push(child)
+}
+
+fn state_of(p: P, id: u32) -> u32 { p.doc.conts[cont_of(p, id) as usize].state }
+
+fn set_state(inout p: P, id: u32, state: u32) {
+    let c = cont_of(p, id) as usize
+    p.doc.conts[c].state = state
+}
+
+fn last_elem(p: P, arr: u32) -> u32 {
+    let c = cont_of(p, arr) as usize
+    p.doc.conts[c].vals[p.doc.conts[c].vals.len() - 1].copy()
+}
+
+// ---- values
+
+/// The characters a number or date-time token is made of.
+fn is_token(c: u8) -> bool { bytes.is_ident(c) || c == 45 || c == 43 || c == 46 || c == 58 }
+
+fn token(inout p: P) -> List[u8] {
+    let mut t: List[u8] = List.new()
+    while is_token(peek(p)) {
+        t.push(peek(p))
+        bump(inout p)
+    }
+    t
+}
+
+fn is_digits(t: List[u8], from: usize, to: usize) -> bool {
+    if from >= to { return false }
+    for i in from..to {
+        if !bytes.is_digit(t[i]) { return false }
+    }
+    true
+}
+
+/// `dddd-dd-dd`
+fn is_date(t: List[u8]) -> bool {
+    t.len() >= 10 && is_digits(t, 0, 4) && t[4] == 45 && is_digits(t, 5, 7) && t[7] == 45 && is_digits(t, 8, 10)
+}
+
+/// `dd:dd:dd` with optional fraction, at `from`.
+fn is_time_at(t: List[u8], from: usize) -> bool {
+    if t.len() < from + 8 { return false }
+    is_digits(t, from, from + 2) && t[from + 2] == 58 && is_digits(t, from + 3, from + 5) && t[from + 5] == 58 && is_digits(t, from + 6, from + 8)
+}
+
+fn has_byte(t: List[u8], b: u8) -> bool {
+    for c in t {
+        if c == b { return true }
+    }
+    false
+}
+
+/// A decimal integer's digits (with `_` between digits) without the underscores, or None.
+fn clean_digits(t: List[u8], from: usize) -> Option[List[u8]] {
+    let mut out: List[u8] = List.new()
+    if from >= t.len() { return None }
+    for i in from..t.len() {
+        let c = t[i]
+        if c == 95 {
+            if i == from || i + 1 >= t.len() || !bytes.is_digit(t[i - 1]) || !bytes.is_digit(t[i + 1]) { return None }
+        } else if bytes.is_digit(c) {
+            out.push(c)
+        } else {
+            return None
+        }
+    }
+    Some(out)
+}
+
+fn radix_int(inout p: P, t: List[u8], line: u32, radix: u64) -> Result[u32, ParseError] {
+    let mut v: u64 = 0
+    if t.len() < 3 { return Err(fail(p, "an integer needs digits after the prefix")) }
+    for i in 2..t.len() {
+        let c = t[i]
+        if c == 95 {
+            if i == 2 || i + 1 >= t.len() || t[i - 1] == 95 { return Err(fail(p, "a misplaced `_` in the integer")) }
+            continue
+        }
+        let h = hexval(c)
+        if h < 0 || (h as u64) >= radix { return Err(fail(p, "a digit out of range for the base")) }
+        if v > (9223372036854775807 - h as u64) / radix { return Err(fail(p, "integer out of range")) }
+        v = v * radix + h as u64
+    }
+    Ok(add_node(inout p, INT, 0, v as i64, line))
+}
+
+fn scalar(inout p: P) -> Result[u32, ParseError] {
+    let line = p.line.copy()
+    let c = peek(p)
+    let mut t = token(inout p)
+    if t.len() == 0 { return Err(fail(p, "expected a value")) }
+    // a date and a time may be separated by a space
+    if is_date(t) && t.len() == 10 && peek(p) == 32 && bytes.is_digit(peek_at(p, 1)) && bytes.is_digit(peek_at(p, 2)) && peek_at(p, 3) == 58 {
+        t.push(84)
+        bump(inout p)
+        bytes.append(inout t, token(inout p))
+    }
+    if bytes.eq(t, "true".bytes()) { return Ok(add_node(inout p, BOOL, 0, 1, line)) }
+    if bytes.eq(t, "false".bytes()) { return Ok(add_node(inout p, BOOL, 0, 0, line)) }
+    if bytes.eq(t, "inf".bytes()) || bytes.eq(t, "+inf".bytes()) || bytes.eq(t, "-inf".bytes()) || bytes.eq(t, "nan".bytes()) || bytes.eq(t, "+nan".bytes()) || bytes.eq(t, "-nan".bytes()) {
+        return Ok(add_str_node(inout p, FLOAT, t, line))
+    }
+    if is_date(t) {
+        if t.len() == 10 { return Ok(add_str_node(inout p, LOCAL, t, line)) }
+        if (t[10] == 84 || t[10] == 116) && is_time_at(t, 11) {
+            let mut norm = t.copy()
+            norm[10] = 84
+            // an offset: Z or +hh:mm / -hh:mm after the time
+            let tail = bytes.slice(t, 19, t.len())
+            let mut off = false
+            for b in tail {
+                if b == 90 || b == 122 || b == 43 || b == 45 { off = true }
+            }
+            if off { return Ok(add_str_node(inout p, DATETIME, norm, line)) }
+            return Ok(add_str_node(inout p, LOCAL, norm, line))
+        }
+        return Err(fail(p, "not a valid date-time"))
+    }
+    if is_time_at(t, 0) { return Ok(add_str_node(inout p, LOCAL, t, line)) }
+    if t.len() > 2 && t[0] == 48 && (t[1] == 120 || t[1] == 111 || t[1] == 98) {
+        let radix: u64 = if t[1] == 120 { 16 } else if t[1] == 111 { 8 } else { 2 }
+        return radix_int(inout p, t, line, radix)
+    }
+    let mut neg = false
+    let mut from: usize = 0
+    if t[0] == 45 || t[0] == 43 {
+        neg = t[0] == 45
+        from = 1
+    }
+    if from >= t.len() || !(bytes.is_digit(t[from]) || t[from] == 46) { return Err(fail(p, "expected a value (a string, number, boolean, date-time, array or inline table)")) }
+    let is_float = has_byte(t, 46) || has_byte(t, 101) || has_byte(t, 69)
+    if !is_float {
+        let digits = match clean_digits(t, from) {
+            Some(d) => d
+            None => { return Err(fail(p, "expected a value (a string, number, boolean, date-time, array or inline table)")) }
+        }
+        if digits.len() > 1 && digits[0] == 48 { return Err(fail(p, "an integer has no leading zeros")) }
+        let v = match bytes.parse_u64(digits) {
+            Some(x) => x
+            None => { return Err(fail(p, "integer out of range")) }
+        }
+        if neg {
+            if v > 9223372036854775808 { return Err(fail(p, "integer out of range")) }
+            if v == 9223372036854775808 { return Ok(add_node(inout p, INT, 0, -9223372036854775807 - 1, line)) }
+            return Ok(add_node(inout p, INT, 0, 0 - (v as i64), line))
+        }
+        if v > 9223372036854775807 { return Err(fail(p, "integer out of range")) }
+        return Ok(add_node(inout p, INT, 0, v as i64, line))
+    }
+    // a float: digits [. digits] [e [+-] digits], underscores between digits
+    let mut text: List[u8] = List.new()
+    let mut i = from
+    if neg { text.push(45) }
+    let n = t.len()
+    let int_start = i.copy()
+    while i < n && (bytes.is_digit(t[i]) || t[i] == 95) { i += 1 }
+    let int_part = match clean_digits(bytes.slice(t, int_start, i), 0) {
+        Some(d) => d
+        None => { return Err(fail(p, "not a valid float")) }
+    }
+    if int_part.len() > 1 && int_part[0] == 48 { return Err(fail(p, "a float has no leading zeros")) }
+    bytes.append(inout text, int_part)
+    if i < n && t[i] == 46 {
+        i += 1
+        let fs = i.copy()
+        while i < n && (bytes.is_digit(t[i]) || t[i] == 95) { i += 1 }
+        let frac = match clean_digits(bytes.slice(t, fs, i), 0) {
+            Some(d) => d
+            None => { return Err(fail(p, "digits are needed after the decimal point")) }
+        }
+        text.push(46)
+        bytes.append(inout text, frac)
+    }
+    if i < n && (t[i] == 101 || t[i] == 69) {
+        i += 1
+        text.push(101)
+        if i < n && (t[i] == 43 || t[i] == 45) {
+            text.push(t[i])
+            i += 1
+        }
+        let es = i.copy()
+        while i < n && (bytes.is_digit(t[i]) || t[i] == 95) { i += 1 }
+        let ex = match clean_digits(bytes.slice(t, es, i), 0) {
+            Some(d) => d
+            None => { return Err(fail(p, "digits are needed in the exponent")) }
+        }
+        bytes.append(inout text, ex)
+    }
+    if i != n { return Err(fail(p, "not a valid float")) }
+    Ok(add_str_node(inout p, FLOAT, text, line))
+}
+
+/// A value at the cursor.
+fn value(inout p: P) -> Result[u32, ParseError] {
+    let c = peek(p)
+    let line = p.line.copy()
+    if c == 34 || c == 39 {
+        let s = string(inout p)?
+        return Ok(add_str_node(inout p, STR, s, line))
+    }
+    if c == 91 { return array(inout p) }
+    if c == 123 { return inline_table(inout p) }
+    scalar(inout p)
+}
+
+fn enter(inout p: P) -> Result[(), ParseError] {
+    p.depth += 1
+    if p.depth > MAX_DEPTH { return Err(fail(p, "nested too deeply")) }
+    Ok(())
+}
+
+fn array(inout p: P) -> Result[u32, ParseError] {
+    enter(inout p)?
+    let line = p.line.copy()
+    bump(inout p)
+    let arr = add_cont(inout p, ARRAY, STATIC, line)
+    while true {
+        space(inout p)?
+        if peek(p) == 93 {
+            bump(inout p)
+            p.depth -= 1
+            return Ok(arr)
+        }
+        let v = value(inout p)?
+        push_elem(inout p, arr, v)
+        space(inout p)?
+        if peek(p) == 44 {
+            bump(inout p)
+        } else if peek(p) != 93 {
+            return Err(fail(p, "expected `,` or `]`"))
+        }
+    }
+    Ok(arr)
+}
+
+/// Defines `parts` as dotted keys under table `t` and returns the table that holds the last
+/// one, plus the last key.
+fn dotted_parent(inout p: P, t: u32, parts: List[List[u8]]) -> Result[u32, ParseError] {
+    let mut cur = t.copy()
+    for i in 0..(parts.len() - 1) {
+        match find(p, cur, parts[i].copy()) {
+            Some(child) => {
+                let node = p.doc.nodes[child as usize].copy()
+                if node.kind != TABLE { return Err(fail(p, "the key is not a table")) }
+                let st = state_of(p, child)
+                if st != DOTTED { return Err(fail(p, "the table was defined elsewhere and cannot be extended by a dotted key")) }
+                cur = child
+            }
+            None => {
+                let ln = p.line.copy()
+                let nt = add_cont(inout p, TABLE, DOTTED, ln)
+                put(inout p, cur, parts[i].copy(), nt)
+                cur = nt
+            }
+        }
+    }
+    Ok(cur)
+}
+
+/// `key = value` into table `t`.
+fn key_value(inout p: P, t: u32) -> Result[(), ParseError] {
+    let parts = key_path(inout p)?
+    if peek(p) != 61 { return Err(fail(p, "expected `=` after the key")) }
+    bump(inout p)
+    blank(inout p)
+    let parent = dotted_parent(inout p, t, parts)?
+    let last = parts[parts.len() - 1].copy()
+    if find(p, parent, last.copy()).is_some() { return Err(fail(p, "the key is defined twice")) }
+    let v = value(inout p)?
+    put(inout p, parent, last, v)
+    Ok(())
+}
+
+fn inline_table(inout p: P) -> Result[u32, ParseError] {
+    enter(inout p)?
+    let line = p.line.copy()
+    bump(inout p)
+    let t = add_cont(inout p, TABLE, CLOSED, line)
+    blank(inout p)
+    if peek(p) == 125 {
+        bump(inout p)
+        p.depth -= 1
+        return Ok(t)
+    }
+    // dotted keys inside may need to extend, so the table is open until its end
+    set_state(inout p, t, DOTTED)
+    while true {
+        blank(inout p)
+        key_value(inout p, t)?
+        blank(inout p)
+        if peek(p) == 125 {
+            bump(inout p)
+            set_state(inout p, t, CLOSED)
+            close_dotted(inout p, t)
+            p.depth -= 1
+            return Ok(t)
+        }
+        if peek(p) != 44 { return Err(fail(p, r"expected `,` or `}`")) }
+        bump(inout p)
+    }
+    Ok(t)
+}
+
+/// The tables made by dotted keys inside a closed inline table are closed too.
+fn close_dotted(inout p: P, t: u32) {
+    let c = cont_of(p, t) as usize
+    let n = p.doc.conts[c].vals.len()
+    for i in 0..n {
+        let child = p.doc.conts[c].vals[i].copy()
+        if p.doc.nodes[child as usize].kind == TABLE && state_of(p, child) == DOTTED {
+            set_state(inout p, child, CLOSED)
+            close_dotted(inout p, child)
+        }
+    }
+}
+
+// ---- headers
+
+/// The table a header's intermediate segment names (`[a.b.c]`: a and b).
+fn walk(inout p: P, cur: u32, seg: List[u8]) -> Result[u32, ParseError] {
+    match find(p, cur, seg.copy()) {
+        Some(child) => {
+            let k = p.doc.nodes[child as usize].kind
+            if k == TABLE {
+                if state_of(p, child) == CLOSED { return Err(fail(p, "an inline table cannot be extended")) }
+                return Ok(child)
+            }
+            if k == ARRAY && state_of(p, child) == TABLES { return Ok(last_elem(p, child)) }
+            Err(fail(p, "the key is already a value, not a table"))
+        }
+        None => {
+            let ln = p.line.copy()
+            let nt = add_cont(inout p, TABLE, IMPLICIT, ln)
+            put(inout p, cur, seg, nt)
+            Ok(nt)
+        }
+    }
+}
+
+/// `[a.b]` or `[[a.b]]` (the cursor is at the first `[`): the table that follows belongs here.
+fn header(inout p: P) -> Result[u32, ParseError] {
+    bump(inout p)
+    let is_array = peek(p) == 91
+    if is_array { bump(inout p) }
+    blank(inout p)
+    let parts = key_path(inout p)?
+    if peek(p) != 93 { return Err(fail(p, "expected `]`")) }
+    bump(inout p)
+    if is_array {
+        if peek(p) != 93 { return Err(fail(p, "expected `]]`")) }
+        bump(inout p)
+    }
+    end_line(inout p)?
+    let mut cur = p.doc.root.copy()
+    for i in 0..(parts.len() - 1) { cur = walk(inout p, cur, parts[i].copy())? }
+    let last = parts[parts.len() - 1].copy()
+    let line = p.line - 1
+    match find(p, cur, last.copy()) {
+        Some(child) => {
+            let k = p.doc.nodes[child as usize].kind
+            if is_array {
+                if k != ARRAY || state_of(p, child) != TABLES { return Err(fail(p, "the key is already defined and is not an array of tables")) }
+                let nt = add_cont(inout p, TABLE, DEFINED, line)
+                push_elem(inout p, child, nt)
+                return Ok(nt)
+            }
+            if k != TABLE { return Err(fail(p, "the key is already defined and is not a table")) }
+            if state_of(p, child) != IMPLICIT { return Err(fail(p, "the table is defined twice")) }
+            set_state(inout p, child, DEFINED)
+            Ok(child)
+        }
+        None => {
+            if is_array {
+                let arr = add_cont(inout p, ARRAY, TABLES, line)
+                let nt = add_cont(inout p, TABLE, DEFINED, line)
+                push_elem(inout p, arr, nt)
+                put(inout p, cur, last, arr)
+                return Ok(nt)
+            }
+            let nt = add_cont(inout p, TABLE, DEFINED, line)
+            put(inout p, cur, last, nt)
+            Ok(nt)
+        }
+    }
+}
+
+/// Limits on a document read from an untrusted source.
+pub type Limits = { max_bytes: u64 }
+
+pub fn limits() -> Limits { Limits(8388608) }
+
+pub fn lenient() -> Limits { Limits(18446744073709551615) }
+
+/// Parses a TOML document.
+pub fn parse(src: List[u8]) -> Result[Doc, ParseError] { parse_with(src, lenient()) }
+
+pub fn parse_with(src: List[u8], lim: Limits) -> Result[Doc, ParseError] {
+    if (src.len() as u64) > lim.max_bytes { return Err(ParseError(1, 1, String.from("the document is too large"))) }
+    let mut p = P(src, 0, 1, 1, Doc(List.new(), List.new(), List.new(), 0), 0)
+    // a byte order mark
+    if p.src.len() >= 3 && p.src[0] == 239 && p.src[1] == 187 && p.src[2] == 191 {
+        bump(inout p)
+        bump(inout p)
+        bump(inout p)
+        p.col = 1
+    }
+    let root = add_cont(inout p, TABLE, DEFINED, 1)
+    p.doc.root = root
+    let mut cur = root.copy()
+    while true {
+        space(inout p)?
+        if at_end(p) { return Ok(p.doc) }
+        if peek(p) == 91 {
+            cur = header(inout p)?
+        } else {
+            key_value(inout p, cur)?
+            end_line(inout p)?
+        }
+    }
+    Ok(p.doc)
+}
+
+// ---- reading a document
+
+pub fn kind(d: Doc, id: u32) -> u32 { d.nodes[id as usize].kind }
+
+fn cont(d: Doc, id: u32) -> Cont { d.conts[d.nodes[id as usize].a as usize].copy() }
+
+/// The number of elements of an array or members of a table.
+pub fn len(d: Doc, id: u32) -> u32 {
+    let k = kind(d, id)
+    if k != ARRAY && k != TABLE { return 0 }
+    cont(d, id).vals.len() as u32
+}
+
+/// The member `key` of a table.
+pub fn get(d: Doc, id: u32, key: List[u8]) -> Option[u32] {
+    if kind(d, id) != TABLE { return None }
+    let c = cont(d, id)
+    for i in 0..c.keys.len() {
+        if bytes.eq(c.keys[i], key) { return Some(c.vals[i].copy()) }
+    }
+    None
+}
+
+fn text(d: Doc, id: u32) -> List[u8] { d.strs[d.nodes[id as usize].a as usize].copy() }
+
+/// The path-style name of a node kind, for messages.
+fn kind_word(k: u32) -> str {
+    if k == STR { return "a string" }
+    if k == INT { return "an integer" }
+    if k == FLOAT { return "a float" }
+    if k == BOOL { return "a boolean" }
+    if k == DATETIME { return "a date-time" }
+    if k == LOCAL { return "a local date or time" }
+    if k == ARRAY { return "an array" }
+    "a table"
+}
+
+/// A cursor on node `node` of a parsed document, for `serial.Deserialize`: the format named
+/// "toml". `path` is the path to the node (`servers[1].host`).
+pub type Deserializer = { doc: Doc, node: u32, path: List[u8] }
+
+/// A reader of node `node` (path empty).
+pub fn deserializer(doc: Doc, node: u32) -> Deserializer { Deserializer(doc, node, List.new()) }
+
+impl serial.Deserializer for Deserializer {
+    fn format(self) -> str { "toml" }
+    fn path(self) -> List[u8] { self.path.copy() }
+    fn kind(self) -> serial.Kind {
+        let k = kind(self.doc, self.node)
+        if k == STR { return serial.KStr }
+        if k == INT { return serial.KInt }
+        if k == FLOAT { return serial.KFloat }
+        if k == BOOL { return serial.KBool }
+        if k == DATETIME || k == LOCAL { return serial.KTime }
+        if k == ARRAY { return serial.KList }
+        serial.KMap
+    }
+    fn read_bool(self) -> Result[bool, serial.Error] {
+        if kind(self.doc, self.node) != BOOL { return Err(serial.expected(self, "a boolean")) }
+        Ok(self.doc.nodes[self.node as usize].n != 0)
+    }
+    fn read_i64(self) -> Result[i64, serial.Error] {
+        if kind(self.doc, self.node) != INT { return Err(serial.expected(self, "an integer")) }
+        Ok(self.doc.nodes[self.node as usize].n)
+    }
+    fn read_u64(self) -> Result[u64, serial.Error] {
+        if kind(self.doc, self.node) != INT { return Err(serial.expected(self, "an integer")) }
+        let n = self.doc.nodes[self.node as usize].n
+        if n < 0 { return Err(serial.fail(self, "the number is out of range")) }
+        Ok(n as u64)
+    }
+    fn read_f64(self) -> Result[f64, serial.Error] {
+        let k = kind(self.doc, self.node)
+        if k == INT { return Ok(self.doc.nodes[self.node as usize].n as f64) }
+        if k != FLOAT { return Err(serial.expected(self, "a number")) }
+        let t = text(self.doc, self.node)
+        let zero = 0.0
+        if bytes.ends_with(t, "inf".bytes()) {
+            if t[0] == 45 { return Ok(-1.0 / zero) }
+            return Ok(1.0 / zero)
+        }
+        if bytes.ends_with(t, "nan".bytes()) { return Ok(zero / zero) }
+        match String.from_bytes(t) {
+            Ok(s) => match strings.parse_f64(s) {
+                Ok(v) => Ok(v)
+                Err(_) => Err(serial.fail(self, "the number is out of range"))
+            }
+            Err(_) => Err(serial.fail(self, "not a number"))
+        }
+    }
+    fn read_string(self) -> Result[List[u8], serial.Error] {
+        if kind(self.doc, self.node) != STR { return Err(serial.expected(self, "a string")) }
+        Ok(text(self.doc, self.node))
+    }
+    fn read_bytes(self) -> Result[List[u8], serial.Error] {
+        if kind(self.doc, self.node) != STR { return Err(serial.expected(self, "a base64 string")) }
+        match encoding.unbase64(text(self.doc, self.node)) {
+            Ok(b) => Ok(b)
+            Err(_) => Err(serial.fail(self, "not base64 text"))
+        }
+    }
+    fn read_time(self) -> Result[time.DateTime, serial.Error] {
+        let k = kind(self.doc, self.node)
+        if k == LOCAL { return Err(serial.fail(self, "expected a date-time with a UTC offset, found a local date or time")) }
+        if k != DATETIME { return Err(serial.expected(self, "a date-time")) }
+        match time.parse_rfc3339(text(self.doc, self.node)) {
+            Ok(t) => Ok(t)
+            Err(m) => Err(serial.error_at(self.path.copy(), m.bytes()))
+        }
+    }
+    fn len(self) -> usize { len(self.doc, self.node) as usize }
+    fn at(self, i: usize) -> Result[Deserializer, serial.Error] {
+        if kind(self.doc, self.node) == ARRAY {
+            let c = cont(self.doc, self.node)
+            if i < c.vals.len() { return Ok(Deserializer(self.doc, c.vals[i].copy(), serial.path_index(self.path, i))) }
+        }
+        Err(serial.fail(self, "no such element"))
+    }
+    fn get(self, key: List[u8]) -> Option[Deserializer] {
+        match get(self.doc, self.node, key.copy()) {
+            Some(id) => Some(Deserializer(self.doc, id, serial.path_field(self.path, key)))
+            None => None
+        }
+    }
+    fn key_at(self, i: usize) -> List[u8] {
+        if kind(self.doc, self.node) != TABLE { return List.new() }
+        cont(self.doc, self.node).keys[i].copy()
+    }
+    fn value_at(self, i: usize) -> Deserializer {
+        let c = cont(self.doc, self.node)
+        Deserializer(self.doc, c.vals[i].copy(), serial.path_field(self.path, c.keys[i]))
+    }
+}
