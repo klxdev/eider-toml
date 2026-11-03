@@ -38,7 +38,7 @@ payload = "AQID"
 2
 3
 missing -> missing field `max-conns`
-unknown -> unknown field `bogus`
+unknown -> missing field `title`
 type -> title: expected a string, found an integer
 syntax -> line 1, column 9: expected a value
 dup -> line 2, column 9: the key is defined twice
