@@ -1,5 +1,5 @@
 [package]
 name = "toml"
-version = "0.5.0"
-eider = "0.5"
+version = "0.6.0"
+eider = "0.6"
 description = "TOML 1.0 as a std/serial format, a document tree, and the flattened subset Eider manifests use"

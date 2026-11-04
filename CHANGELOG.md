@@ -3,9 +3,9 @@
 eider-toml's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
-## Unreleased
+## 0.6.0
 
-For Eider 0.6.
+For Eider 0.6 (`eider = "0.6"`).
 
 - TOML is a format for `std/serial` (eider-lang #100, #167): `toml.to_string`, `to_bytes`, `from_string`, `from_bytes`, `from_bytes_with`, and `Serializer`/`Deserializer`. Types opt in with `@[derive(Serialize, Deserialize)]`; `@[serial(...)]` shapes every format and `@[toml(...)]` this one.
 - New module `toml.doc`: a complete TOML 1.0 parser into an arena tree (`doc.parse`), with the spec's redefinition rules, every string form, floats, date-times, inline tables and arrays of tables. The flattened `toml.parse`/`get`/`children`/`quote` that eider-pkg reads are unchanged.
